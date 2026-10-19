@@ -1,0 +1,13 @@
+{
+  "tasks": {
+    "unlock": "deno run --allow-env --allow-read --allow-write --allow-run unlock.ts unlock",
+    "watch": "deno run --allow-env --allow-read --allow-write --allow-run unlock.ts watch",
+    "status": "deno run --allow-env --allow-read --allow-write --allow-run unlock.ts status",
+    "install": "deno run --allow-env --allow-read --allow-write --allow-run unlock.ts install",
+    "uninstall": "deno run --allow-env --allow-read --allow-write --allow-run unlock.ts uninstall",
+    "doctor": "deno run --allow-env --allow-read --allow-write --allow-run unlock.ts doctor",
+    "compile-win": "deno compile --allow-env --allow-read --allow-write --allow-run --target x86_64-pc-windows-msvc --output dist/unlock-win.exe unlock.ts",
+    "compile-mac-arm": "deno compile --allow-env --allow-read --allow-write --allow-run --target aarch64-apple-darwin --output dist/unlock-mac-arm unlock.ts",
+    "compile-mac-x64": "deno compile --allow-env --allow-read --allow-write --allow-run --target x86_64-apple-darwin --output dist/unlock-mac-x64 unlock.ts"
+  }
+}

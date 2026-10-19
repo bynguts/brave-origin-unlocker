@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Deno
+.deno/
+
+# Build output
+dist/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+
+# Agent/tooling state
+.omc/
+.claude/
+AGENTS.md
+
+# Benchmark scratch
+bench/
