@@ -174,7 +174,10 @@ async function readLocalState(
   path: string,
 ): Promise<Record<string, unknown> | null> {
   try {
-    return JSON.parse(await Deno.readTextFile(path)) as Record<string, unknown>;
+    // Strip a leading UTF-8 BOM if present — Brave writes none, but a hand-edit
+    // in a BOM-adding editor would otherwise make JSON.parse throw.
+    const text = (await Deno.readTextFile(path)).replace(/^﻿/, "");
+    return JSON.parse(text) as Record<string, unknown>;
   } catch (error) {
     if (error instanceof Deno.errors.NotFound) {
       return null;
