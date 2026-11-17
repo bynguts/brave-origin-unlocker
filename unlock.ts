@@ -66,6 +66,21 @@ function sleep(ms: number): Promise<void> {
   return promise;
 }
 
+/** Escape a string for safe use inside a single-quoted PowerShell literal. */
+function psSingleQuote(s: string): string {
+  return `'${s.replaceAll("'", "''")}'`;
+}
+
+/** Escape text for inclusion in an XML text node (plist values). */
+function xmlEscape(s: string): string {
+  return s
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
 /** Resolve the watchdog executable: the compiled exe when run as one,
  *  otherwise dist/unlock-win.exe when invoked via `deno task`. */
 function resolveWatchdogExe(): string {
@@ -75,8 +90,12 @@ function resolveWatchdogExe(): string {
     return exec;
   }
   const candidate = `${Deno.cwd()}${os === "windows" ? "\\" : "/"}dist${os === "windows" ? "\\" : "/"}${WATCHDOG_IMAGE}`;
-  if (Deno.statSync(candidate).isFile) {
-    return candidate;
+  try {
+    if (Deno.statSync(candidate).isFile) {
+      return candidate;
+    }
+  } catch {
+    // statSync throws when the compiled exe is absent — fall through to the hint.
   }
   fail(
     `Watchdog exe not found. Run ${C.bold}deno task compile-win${C.reset} first, or run this command from the compiled binary.`,
@@ -128,13 +147,26 @@ type UnlockResult = "unlocked" | "already" | "missing";
 async function writeAtomic(path: string, data: string): Promise<void> {
   const tmp = `${path}.unlocker-tmp`;
   await Deno.writeTextFile(tmp, data);
-  try {
-    await Deno.rename(tmp, path);
-  } catch {
-    // Windows rename can refuse to overwrite — remove target and retry.
-    await Deno.remove(path);
-    await Deno.rename(tmp, path);
+  // Deno.rename replaces the destination atomically on both platforms. A failure
+  // here means the target is briefly locked (browser/updater holding a handle);
+  // retry a few times, then surface the error — never delete the original first,
+  // so a failed swap can never destroy the existing Local State.
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await Deno.rename(tmp, path);
+      return;
+    } catch (error) {
+      lastErr = error;
+      await sleep(100);
+    }
   }
+  try {
+    await Deno.remove(tmp);
+  } catch {
+    // leave the temp file behind if even cleanup fails
+  }
+  throw lastErr;
 }
 
 /** Read and parse a Local State file, or null when the channel is not installed. */
@@ -151,6 +183,20 @@ async function readLocalState(
   }
 }
 
+/** The three-part predicate that defines an unlocked Local State. Single source
+ *  of truth shared by the unlock, status and doctor paths. */
+function isUnlocked(localState: Record<string, unknown>): boolean {
+  const brave = localState.brave as
+    | { origin?: { purchase_validated?: boolean; policies_were_enforced?: boolean } }
+    | undefined;
+  const skus = localState.skus as { state?: { "67"?: string } } | undefined;
+  const sku67 = skus?.state?.["67"];
+  return brave?.origin?.purchase_validated === true &&
+    brave?.origin?.policies_were_enforced === true &&
+    typeof sku67 === "string" &&
+    sku67.includes("credentials");
+}
+
 /** Apply the unlock to one channel, idempotently and atomically.
  *  Keeps a one-time backup of the pristine Local State before first write. */
 async function unlockOne(version: string): Promise<UnlockResult> {
@@ -160,36 +206,18 @@ async function unlockOne(version: string): Promise<UnlockResult> {
     return "missing";
   }
 
-  const brave = localState.brave as
-    | {
-      origin?: {
-        purchase_validated?: boolean;
-        policies_were_enforced?: boolean;
-      };
-    }
-    | undefined;
-  const skus = localState.skus as { state?: { "67"?: string } } | undefined;
-  const alreadyUnlocked =
-    brave?.origin?.purchase_validated === true &&
-    brave?.origin?.policies_were_enforced === true &&
-    typeof skus?.state?.["67"] === "string" &&
-    skus.state["67"].includes("credentials");
-  if (alreadyUnlocked) {
+  if (isUnlocked(localState)) {
     return "already";
   }
 
-  // One-time backup of the pristine file (kept for uninstall/repair).
+  // One-time backup of the pristine file (kept for uninstall/repair). copyFile
+  // overwrites by default, so only snapshot when no backup exists yet — never
+  // clobber the pristine copy with already-modified state on a later heal.
   const backupPath = `${localStatePath}.unlocker-backup`;
   try {
+    await Deno.stat(backupPath);
+  } catch {
     await Deno.copyFile(localStatePath, backupPath);
-  } catch (error) {
-    if (!(error instanceof Deno.errors.AlreadyExists)) {
-      try {
-        await Deno.stat(backupPath);
-      } catch {
-        throw error;
-      }
-    }
   }
 
   const braveState = (localState.brave ?? {}) as Record<string, unknown>;
@@ -264,27 +292,63 @@ async function unlockAll(quiet: boolean): Promise<boolean> {
   return foundAny;
 }
 
-/** Single-instance guard for watch mode via a pid lock file. */
+/** True while a process with the given pid (and our image, on Windows) exists.
+ *  Per-OS so the liveness probe is never silently unavailable. */
+async function isPidAlive(pid: number): Promise<boolean> {
+  if (!Number.isFinite(pid)) return false;
+  if (os === "windows") {
+    const probe = new Deno.Command("tasklist", {
+      args: [
+        "/FI",
+        `PID eq ${pid}`,
+        "/FI",
+        `IMAGENAME eq ${WATCHDOG_IMAGE}`,
+        "/FO",
+        "CSV",
+        "/NH",
+      ],
+      stdout: "piped",
+      stderr: "null",
+    });
+    const { stdout } = await probe.output();
+    return new TextDecoder().decode(stdout).includes(`"${pid}"`);
+  }
+  // POSIX: a signal-0-style liveness probe. SIGCONT is a no-op for a process we
+  // own and throws when the pid is gone.
+  try {
+    Deno.kill(pid, "SIGCONT");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Single-instance guard for watch mode via a pid lock file. The liveness check
+ *  is per-OS (tasklist on Windows, signal probe on POSIX), so the guard is never
+ *  silently void, and the lock is released on normal exit. */
 async function acquireWatchLock(): Promise<void> {
   const tmpDir = Deno.env.get("TEMP") ?? Deno.env.get("TMP") ?? "/tmp";
   const lockPath = `${tmpDir}${os === "windows" ? "\\" : "/"}brave-origin-unlocker.watch.lock`;
   try {
     const pid = parseInt((await Deno.readTextFile(lockPath)).trim(), 10);
-    const alive = new Deno.Command("tasklist", {
-      args: ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
-      stdout: "piped",
-      stderr: "null",
-    });
-    const { stdout } = await alive.output();
-    const running = new TextDecoder().decode(stdout).includes(`"${pid}"`);
-    if (running && pid !== Deno.pid) {
+    if (pid !== Deno.pid && (await isPidAlive(pid))) {
       fail(`Watchdog already running (pid ${pid}). Exiting this instance.`);
       Deno.exit(1);
     }
   } catch {
-    // No lock file (or unreadable pid) — safe to take over.
+    // No lock file (or unreadable/dead pid) — safe to take over.
   }
   await Deno.writeTextFile(lockPath, String(Deno.pid));
+  // Best-effort release so a reused pid can't later read as a live watchdog.
+  globalThis.addEventListener("unload", () => {
+    try {
+      if (parseInt(Deno.readTextFileSync(lockPath).trim(), 10) === Deno.pid) {
+        Deno.removeSync(lockPath);
+      }
+    } catch {
+      // lock already gone or taken over by another instance — nothing to do.
+    }
+  });
 }
 
 /** Ensure the hidden autostart launcher exists (Startup .vbs on Windows). */
@@ -297,7 +361,7 @@ async function ensureAutostart(): Promise<void> {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.brave-origin-unlocker</string>
-  <key>ProgramArguments</key><array><string>${exe}</string><string>--watch</string></array>
+  <key>ProgramArguments</key><array><string>${xmlEscape(exe)}</string><string>--watch</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict></plist>
@@ -306,7 +370,9 @@ async function ensureAutostart(): Promise<void> {
     }
     return;
   }
-  const exe = resolveWatchdogExe().replaceAll("\\", "\\\\");
+  // Windows forbids " in paths, so the double-quoted VBS literal below needs no
+  // escaping; backslashes are literal in VBScript strings (no escape syntax).
+  const exe = resolveWatchdogExe();
   const vbs = `' Brave Origin unlock watchdog - re-applies unlock after the browser closes.
 ' Managed by brave-origin-unlocker; remove via "unlock-win.exe uninstall".
 Set shell = CreateObject("WScript.Shell")
@@ -337,7 +403,7 @@ async function launchWatchdogHidden(): Promise<void> {
       args: [
         "-NoProfile",
         "-Command",
-        `Start-Process -WindowStyle Hidden -FilePath '${exe}' -Argument '--watch'`,
+        `Start-Process -WindowStyle Hidden -FilePath ${psSingleQuote(exe)} -ArgumentList '--watch'`,
       ],
       stdout: "null",
       stderr: "null",
@@ -403,20 +469,7 @@ async function cmdStatus(): Promise<void> {
       console.log(`  ${C.dim}— ${version}: not installed${C.reset}`);
       continue;
     }
-    const brave = localState.brave as
-      | {
-        origin?: {
-          purchase_validated?: boolean;
-          policies_were_enforced?: boolean;
-        };
-      }
-      | undefined;
-    const skus = localState.skus as { state?: { "67"?: string } } | undefined;
-    const unlocked =
-      brave?.origin?.purchase_validated === true &&
-      brave?.origin?.policies_were_enforced === true &&
-      typeof skus?.state?.["67"] === "string" &&
-      skus.state["67"].includes("credentials");
+    const unlocked = isUnlocked(localState);
     const state = unlocked
       ? `${C.green}UNLOCKED${C.reset}`
       : `${C.red}locked${C.reset}`;
@@ -432,7 +485,7 @@ async function cmdStatus(): Promise<void> {
       }`,
     );
   }
-  if (autostartPathExists) {
+  if (autostartExists()) {
     ok(`autostart: enabled (${autostartScriptPath})`);
   } else {
     fail(`autostart: disabled`);
@@ -445,13 +498,14 @@ async function cmdStatus(): Promise<void> {
   }
 }
 
-let autostartPathExists = false;
-try {
-  if (autostartScriptPath !== null) {
-    autostartPathExists = Deno.statSync(autostartScriptPath).isFile;
+/** Live check of whether the autostart launcher file currently exists. */
+function autostartExists(): boolean {
+  try {
+    return autostartScriptPath !== null &&
+      Deno.statSync(autostartScriptPath).isFile;
+  } catch {
+    return false;
   }
-} catch {
-  autostartPathExists = false;
 }
 
 async function cmdInstall(): Promise<void> {
@@ -467,10 +521,14 @@ async function cmdInstall(): Promise<void> {
   await sleep(1000);
   await launchWatchdogHidden();
   await sleep(3000);
-  if (os === "windows" && (await isProcessRunning(WATCHDOG_IMAGE))) {
-    ok("Watchdog started (hidden, background).");
+  if (os === "windows") {
+    if (await isProcessRunning(WATCHDOG_IMAGE)) {
+      ok("Watchdog started (hidden, background).");
+    } else {
+      warn("Watchdog may not have started — run the doctor command to diagnose.");
+    }
   } else {
-    warn("Watchdog may not have started — run the doctor command to diagnose.");
+    ok("Watchdog registered — the LaunchAgent keeps it running at logon.");
   }
 
   console.log(
@@ -510,23 +568,18 @@ async function cmdDoctor(): Promise<void> {
   let healthy = true;
 
   // 1. Unlock state.
-  let anyUnlocked = false;
   let anyInstalled = false;
   for (const version of channels) {
     const result = await unlockOne(version);
     if (result === "unlocked") {
       ok(`${version.replace(/-/g, " ")}: unlock re-applied (was missing).`);
-      anyUnlocked = true;
       anyInstalled = true;
     } else if (result === "already") {
-      anyUnlocked = true;
       anyInstalled = true;
     }
   }
   if (!anyInstalled) {
     fail("No Brave Origin installation detected.");
-    healthy = false;
-  } else if (!anyUnlocked) {
     healthy = false;
   } else {
     ok("Unlock state: healthy.");
@@ -654,7 +707,10 @@ const channelDir = (version: string) => dirname(localStatePathPattern(version));
 function addChannelWatcher(entries: WatchEntry[], version: string): void {
   const dir = channelDir(version);
   addWatcher(entries, "channel", dir, (p) => {
-    return basename(p).startsWith("Local State");
+    const b = basename(p);
+    // Watch Brave's own Local State writes, but ignore our own tmp/backup files
+    // so a heal's writes don't re-trigger the watcher in a loop.
+    return b.startsWith("Local State") && !b.includes(".unlocker-");
   }, `${dir} (${version})`);
 }
 
@@ -717,6 +773,19 @@ async function nextEvent(entries: WatchEntry[]): Promise<EventResult> {
   }
 }
 
+// A single in-flight event poll shared by the main loop and `settle`. Without
+// it, a `nextEvent` that loses a Promise.race against a timeout is orphaned but
+// keeps running; a later `nextEvent` then races the SAME watcher iterators,
+// double-arming them (two concurrent `iter.next()` on one FsWatcher) and
+// silently dropping events — or tripping a spurious "watcher closed". Reusing
+// one pending poll guarantees exactly one consumer ever re-arms each watcher.
+let inFlightEvent: Promise<EventResult> | null = null;
+function peekEvent(entries: WatchEntry[]): Promise<EventResult> {
+  return (inFlightEvent ??= nextEvent(entries).finally(() => {
+    inFlightEvent = null;
+  }));
+}
+
 type SettleResult = { quiet: true } | { quiet: false };
 
 /** Debounce: wait until `ms` of silence on channel events. Returns early if a
@@ -724,7 +793,7 @@ type SettleResult = { quiet: true } | { quiet: false };
 async function settle(entries: WatchEntry[], ms: number): Promise<SettleResult> {
   while (true) {
     const winner = await Promise.race([
-      nextEvent(entries).then((r) => ({ kind: "event", r }) as const),
+      peekEvent(entries).then((r) => ({ kind: "event", r }) as const),
       sleep(ms).then(() => ({ kind: "timeout" }) as const),
     ]);
     if (winner.kind === "timeout") return { quiet: true };
@@ -742,9 +811,19 @@ async function settle(entries: WatchEntry[], ms: number): Promise<SettleResult> 
 /** Re-apply the unlock after the browser closed or an update wiped it.
  *  Never writes while Brave Origin is running (it would overwrite on exit). */
 async function healIfSafe(): Promise<void> {
-  if (await isOriginRunning()) return;
-  await sleep(500); // let any tmp+rename settle after the last event
-  await unlockAll(true);
+  try {
+    if (await isOriginRunning()) return;
+    await sleep(500); // let any tmp+rename settle after the last event
+    await unlockAll(true);
+  } catch (error) {
+    // A transient file lock or IO error must never kill the watch loop; the
+    // next event (or the 120s safety sweep) retries the heal.
+    warn(
+      `Heal attempt failed (will retry): ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }
 
 async function cmdWatch(): Promise<void> {
@@ -761,7 +840,7 @@ async function cmdWatch(): Promise<void> {
   while (true) {
     if (entries.length === 0) ensureParentWatcher(entries);
     const winner = await Promise.race([
-      nextEvent(entries).then((r) => ({ kind: "event", r }) as const),
+      peekEvent(entries).then((r) => ({ kind: "event", r }) as const),
       sleep(SAFETY_MS).then(() => ({ kind: "safety" }) as const),
     ]);
 
