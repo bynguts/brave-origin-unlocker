@@ -1,6 +1,6 @@
 // Brave Origin Unlocker — professional CLI.
 // Subcommands: unlock | watch | status | install | uninstall | doctor
-const VERSION = "1.0.0";
+const VERSION = "1.0.0"; // dev default; CI stamps the release tag (see .github/workflows/release.yml)
 const WATCHDOG_IMAGE = "unlock-win.exe";
 
 const os = Deno.build.os;
